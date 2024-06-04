@@ -1,39 +1,22 @@
-use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use teemo::Teemo;
-use tokio::sync::{oneshot, RwLock};
-use tokio::task;
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::collections::VecDeque;
+use teemo::Teemo;
+use tokio::sync::RwLock;
+use tokio::task;
 
 struct AppState {
-    task_queue: RwLock<VecDeque<(String, oneshot::Sender<String>)>>,
     lcu_activated: RwLock<bool>,
+}
+#[derive(Deserialize, Serialize)]
+struct TaskRequest {
+    param: String,
 }
 
 async fn greet() -> impl Responder {
     HttpResponse::Ok().body("Hello, world!")
-}
-
-async fn process_task(param: String) -> String {
-    let mut teemo = Teemo::new();
-    teemo.init_lcu_config();
-    format!("Processed: {}--{}", teemo.app_token, param)
-}
-
-async fn lcu_thread(state: Arc<AppState>) {
-    loop {
-        let task_opt = {
-            let mut queue = state.task_queue.write().await;
-            queue.pop_front()
-        };
-        
-        if let Some((param, sender)) = task_opt {
-            let result = process_task(param).await;
-            let _ = sender.send(result);
-        } else {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-        }
-    }
 }
 
 async fn check_lcu(state: Arc<AppState>) {
@@ -43,40 +26,52 @@ async fn check_lcu(state: Arc<AppState>) {
         let mut activated = state.lcu_activated.write().await;
         *activated = teemo.init_lcu_config();
 
-        println!("Program will check LCU every 5 seconds...");
+        let mut lcu_state = "offline";
+
+        if *activated {
+            lcu_state = "online";
+        }
+        println!(
+            "LCU is {}.Program will check LCU every 5 seconds.",
+            lcu_state
+        );
+
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
 }
 
-async fn handle_request(state: web::Data<Arc<AppState>>, info: web::Query<std::collections::HashMap<String, String>>) -> impl Responder {
-    let param = info.get("param").unwrap_or(&"default".to_string()).clone();
-
-    let (tx, rx) = oneshot::channel();
-
-    {
-        let mut queue = state.task_queue.write().await;
-        queue.push_back((param.clone(), tx));
+async fn teemo_req(
+    req: HttpRequest,
+    state: web::Data<Arc<AppState>>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+    body:  web::Json<TaskRequest>,
+) -> impl Responder {
+    if !*state.lcu_activated.read().await {
+        return HttpResponse::BadGateway().body("Please start the LOL client first.");
     }
-
-    let result = rx.await.unwrap_or("Task failed".to_string());
-
-    HttpResponse::Ok().body(result)
+    let lcu_url = query.get("url").unwrap_or(&"default".to_string()).clone();
+    // 获取请求方法
+    let method = req.method().as_str();
+    let mut teemo = Teemo::new();
+    teemo.start();
+    // 将 web::Json<TaskRequest> 转换为 serde_json::Value
+    let body_value: Value = serde_json::to_value(&body).unwrap();
+     // 将 serde_json::Value 转换为 HashMap<String, Value>
+     let body_map: HashMap<String, Value> = match body_value {
+        Value::Object(map) => map.into_iter().collect(),
+        _ => HashMap::new(),
+    };
+    let res = teemo.request(&method, &lcu_url, Some(body_map)).await;
+    HttpResponse::Ok().body(res.to_string())
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let state = Arc::new(AppState {
-        task_queue: RwLock::new(VecDeque::new()),
         lcu_activated: RwLock::new(false),
     });
 
-    let lcu_state = state.clone();
     let check_state = state.clone();
-
-    // 创建并启动lcu线程
-    task::spawn(async move {
-        lcu_thread(lcu_state).await;
-    });
 
     // 创建并启动检查服务连接状态的线程
     task::spawn(async move {
@@ -87,7 +82,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::Data::new(state.clone()))
             .route("/", web::get().to(greet))
-            .route("/task", web::to(handle_request))
+            .route("/lcu_api", web::to(teemo_req))
     })
     .bind("127.0.0.1:8080")?
     .run()
